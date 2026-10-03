@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Custom
+*.nd2
+*.pkl
+*.mp4

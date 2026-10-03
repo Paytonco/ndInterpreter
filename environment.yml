@@ -1,0 +1,15 @@
+name: microscopy
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python>=3.10
+  - nd2
+  - dask
+  - numpy
+  - scipy
+  - matplotlib
+  - scikit-image
+  - imageio-ffmpeg
+  - pyside6
