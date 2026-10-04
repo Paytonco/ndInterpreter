@@ -223,3 +223,6 @@ __marimo__/
 *.nd2
 *.pkl
 *.mp4
+
+# Density proxy comparison notebook (experiment, not part of the tool)
+density_proxies.ipynb

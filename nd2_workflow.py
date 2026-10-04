@@ -19,14 +19,24 @@ microfluidics experiment through the standard pipeline:
   6. per position and fluorescence channel, take the median of the first
      frame outside all traps as the background; it is subtracted from every
      fluorescence frame of that position
-  7. pickle the experiment layout as ``objects/<stem>_metadata.pkl``
-  8. set up a spatial bandpass filter (FFT, order-2 Butterworth transfer
+  7. set up a spatial bandpass filter (FFT, order-2 Butterworth transfer
      function, passing structure between 0.35 um and 4 um by default) that
-     every phase frame goes through before it reaches a video. Fluorescence
-     is not filtered
-  9. write three mp4s per position into ``videos/``: phase, phase + all
-     fluorescence channels, and phase with the traps overlaid (for spotting
-     drift). The file is read once, in on-disk order, feeding every video
+     every phase frame goes through before it is quantified or drawn.
+     Fluorescence is not filtered
+  8. set up the cell density proxy (``--density``, default 1 - GLCM angular
+     second moment; see ``density_proxies.py``). Proxies that need a fixed
+     threshold or intensity range get it from the trap pixels of a few
+     phase frames sampled over the run
+  9. pickle the experiment layout as ``objects/<stem>_metadata.pkl``
+ 10. read the file once, in on-disk order. Every frame is quantified per
+     trap (cell density proxy of the phase inside the trap; mean
+     fluorescence = integrated background-subtracted fluorescence / trap
+     area) and written into three mp4s per position in ``videos/``: phase,
+     phase + all fluorescence channels, and phase with the traps overlaid
+     (for spotting drift)
+ 11. pickle the measurements as ``objects/<stem>_quantified.pkl``:
+     ``{"pos1_ctrl-row_T1": (density, GFP, ...), ..., "Time": times}``,
+     each entry an array with one value per timepoint
 
 The pickled dictionaries carry a top-level ``"Time"`` key: the time axis in
 seconds since the run started (e.g. ``d["Time"]``).
@@ -51,6 +61,10 @@ Change the bandpass cutoffs, or turn it off:
     python nd2_workflow.py --bandpass-min-um 0.5 --bandpass-max-um 10
     python nd2_workflow.py --no-bandpass
 
+Pick a different cell density proxy:
+
+    python nd2_workflow.py --density std
+
 Requires ``nd2``, ``dask``, ``numpy``, ``scipy``, ``scikit-image``, ``matplotlib`` (Qt backend for the
 trap UI), and ``imageio-ffmpeg`` (see ``environment.yml``).
 """
@@ -61,6 +75,7 @@ import argparse
 import os
 import pickle
 import re
+import shutil
 import sys
 import time
 from itertools import pairwise
@@ -69,6 +84,8 @@ from pathlib import Path
 import nd2
 import numpy as np
 import scipy.fft
+
+import density_proxies as dp
 
 REPO_DIR = Path(__file__).resolve().parent
 DATA_DIR = REPO_DIR / "data"
@@ -118,6 +135,10 @@ BANDPASS_ORDER = 2
 # longest passed wavelength, so the image edges don't wrap around and ring.
 BANDPASS_PAD_WAVELENGTHS = 4
 
+# Phase frames sampled per position (spread over the run) to fix the density
+# proxy's threshold / intensity range, for the proxies that need one.
+DENSITY_SAMPLES = 6
+
 # Video defaults.
 DEFAULT_FPS = 10
 # Display color (RGB, 0-1) for each fluorescence key in the composite video.
@@ -141,6 +162,113 @@ TRAP_ALPHA = 0.3
 # Trap colors, cycled per trap (matplotlib's tab10).
 TRAP_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
                "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+
+
+# --------------------------------------------------------------------------- #
+# Command-line progress
+# --------------------------------------------------------------------------- #
+
+def _clock(seconds) -> str:
+    """Seconds -> 'm:ss', or 'h:mm:ss' past an hour."""
+    seconds = round(float(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+class ProgressBar:
+    """One-line progress bar with elapsed time and an estimate of time left.
+
+    On a terminal it redraws in place (at most 10 times a second). When output
+    is redirected to a file, it prints a plain line every 10% instead, so logs
+    stay readable. Use as a context manager so the bar is finished off cleanly
+    even if a step fails::
+
+        with ProgressBar(len(items), "reading frames") as bar:
+            for item in items:
+                ...
+                bar.update()
+    """
+
+    INDENT = "     "
+    REDRAW_S = 0.1
+
+    def __init__(self, total: int, label: str, stream=None):
+        self.total = max(int(total), 1)
+        self.label = label
+        self.done = 0
+        self.stream = stream or sys.stdout
+        self.tty = hasattr(self.stream, "isatty") and self.stream.isatty()
+        self.start = time.monotonic()
+        self._last_draw = 0.0
+        self._next_percent = 10
+        self._closed = False
+        if self.tty:
+            self._draw()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def update(self, n: int = 1) -> None:
+        self.done = min(self.done + n, self.total)
+        if self.tty:
+            now = time.monotonic()
+            if now - self._last_draw >= self.REDRAW_S or self.done == self.total:
+                self._draw()
+        else:
+            percent = 100 * self.done // self.total
+            if percent >= self._next_percent:
+                print(self.INDENT + self._line(bar_width=20), file=self.stream, flush=True)
+                self._next_percent = (percent // 10 + 1) * 10
+
+    def write(self, message: str) -> None:
+        """Print a line above the bar without breaking it."""
+        if self.tty:
+            self.stream.write("\r\033[K")
+        print(message, file=self.stream)
+        if self.tty:
+            self._draw()
+
+    def close(self) -> None:
+        """Finish the bar's line. Safe to call more than once."""
+        if self._closed:
+            return
+        self._closed = True
+        if self.tty:
+            self._draw()
+            self.stream.write("\n")
+            self.stream.flush()
+        elif self._next_percent <= 100 and self.done == self.total:
+            print(self.INDENT + self._line(bar_width=20), file=self.stream, flush=True)
+
+    def _line(self, bar_width: int) -> str:
+        fraction = self.done / self.total
+        filled = round(bar_width * fraction)
+        elapsed = time.monotonic() - self.start
+        if self.done == self.total:
+            timing = f"{_clock(elapsed)} total"
+        elif self.done:
+            timing = f"{_clock(elapsed)} elapsed, ~{_clock(elapsed / self.done * (self.total - self.done))} left"
+        else:
+            timing = f"{_clock(elapsed)} elapsed"
+        bar = "\u2588" * filled + "\u2591" * (bar_width - filled)
+        return (f"{self.label}  {bar}  {self.done}/{self.total}  "
+                f"{fraction:4.0%}  {timing}")
+
+    def _draw(self) -> None:
+        columns = shutil.get_terminal_size((100, 20)).columns
+        # Shrink the bar so the whole line fits; never wrap (that breaks \r).
+        width = 30
+        while width > 5 and len(self.INDENT + self._line(width)) >= columns:
+            width -= 5
+        line = (self.INDENT + self._line(width))[:max(columns - 1, 1)]
+        self.stream.write("\r\033[K" + line)
+        self.stream.flush()
+        self._last_draw = time.monotonic()
 
 
 # --------------------------------------------------------------------------- #
@@ -425,15 +553,17 @@ def percentile_limits(images, percentiles):
 def read_first_frames(f, seqs, positions, channels) -> dict:
     """Read and report t=0 for every position; returns ``{index: {key: array}}``."""
     first = {}
-    for p in positions:
-        frames = read_channels(f, seqs, 0, p["index"], channels)
-        means = []
-        for key, frame in frames.items():
-            means.append(f"{key}={frame.mean():.0f}")
-            if not frame.any():
-                means[-1] += " [EMPTY]"
-        print(f"     {position_label(p):>4}: " + "  ".join(means))
-        first[p["index"]] = frames
+    with ProgressBar(len(positions), "reading first frames") as bar:
+        for p in positions:
+            frames = read_channels(f, seqs, 0, p["index"], channels)
+            means = []
+            for key, frame in frames.items():
+                means.append(f"{key}={frame.mean():.0f}")
+                if not frame.any():
+                    means[-1] += " [EMPTY]"
+            bar.write(f"     {position_label(p):>4}: " + "  ".join(means))
+            first[p["index"]] = frames
+            bar.update()
     return first
 
 
@@ -791,7 +921,7 @@ def fluor_backgrounds(positions, first_frames, channels, shape) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 8. Spatial bandpass
+# 7. Spatial bandpass
 # --------------------------------------------------------------------------- #
 
 def bandpass_transfer(shape, pixel_um, min_um, max_um, order=BANDPASS_ORDER):
@@ -869,7 +999,7 @@ def report_bandpass(bandpass: SpatialBandpass) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 9. Videos
+# 10. Frame pass: quantification and videos
 # --------------------------------------------------------------------------- #
 
 def _render_rgba(width, height, draw):
@@ -1005,34 +1135,35 @@ def contrast_limits(read, positions, channels, n_t):
     """
     sample_ts = sorted({int(t) for t in np.linspace(0, n_t - 1, CONTRAST_SAMPLES).round()})
     limits = {}
-    for p in positions:
-        frames = [read(t, p["index"]) for t in sample_ts]
-        limits[p["index"]] = {}
-        for c in channels:
-            is_phase = c["role"] == "phase"
-            lo, hi = percentile_limits([fr[c["key"]] for fr in frames],
-                                       PHASE_PERCENTILES if is_phase else FLUOR_PERCENTILES)
-            if not is_phase:
-                lo = 0.0
-            limits[p["index"]][c["key"]] = (lo, hi)
+    with ProgressBar(len(positions) * len(sample_ts), "sampling contrast") as bar:
+        for p in positions:
+            frames = []
+            for t in sample_ts:
+                frames.append(read(t, p["index"]))
+                bar.update()
+            limits[p["index"]] = {}
+            for c in channels:
+                is_phase = c["role"] == "phase"
+                lo, hi = percentile_limits([fr[c["key"]] for fr in frames],
+                                           PHASE_PERCENTILES if is_phase else FLUOR_PERCENTILES)
+                if not is_phase:
+                    lo = 0.0
+                limits[p["index"]][c["key"]] = (lo, hi)
     return limits
 
 
-def write_videos(f, seqs, positions, channels, times, out_dir: Path, stem: str, fps,
-                 bandpass=None):
-    """Write phase / composite / trap-overlay mp4s for every position in one pass.
+def process_frames(f, seqs, positions, channels, times, quantifier, bandpass=None,
+                   out_dir=None, stem="", fps=DEFAULT_FPS):
+    """Read every frame once, in on-disk order, quantifying traps and writing videos.
 
     Phase frames go through ``bandpass`` (a ``SpatialBandpass``) first, if
     given. Fluorescence frames are left unfiltered and have the position's
-    ``fluor_background`` level subtracted.
+    ``fluor_background`` level subtracted. Every processed frame is handed to
+    ``quantifier`` (a ``TrapQuantifier``). With ``out_dir`` set, the phase /
+    composite / trap-overlay mp4s are written too; with ``out_dir=None`` only
+    the quantification runs.
     """
-    out_dir.mkdir(parents=True, exist_ok=True)
-    height, width = f.sizes["Y"], f.sizes["X"]
-    # libx264 + yuv420p needs even dimensions; drop a row/column if needed.
-    height, width = height - height % 2, width - width % 2
-    font_px = max(14, height // 40)
     n_t = len(times)
-
     backgrounds = {p["index"]: p["fluor_background"] for p in positions}
 
     def read(t, index):
@@ -1046,66 +1177,211 @@ def write_videos(f, seqs, positions, channels, times, out_dir: Path, stem: str, 
                 frames[key] = frames[key].astype(np.float32) - backgrounds[index][key]
         return frames
 
+    render = None
+    videos = {}
+    bar = None
+    try:
+        if out_dir is not None:
+            render, videos = _video_renderer(f, read, positions, channels, times,
+                                             out_dir, stem, fps)
+        label = "quantifying + writing videos" if render else "quantifying traps"
+        bar = ProgressBar(n_t * len(positions), label)
+        for t in range(n_t):
+            for p in positions:
+                frames = read(t, p["index"])
+                quantifier.add(t, p["index"], frames)
+                if render:
+                    render(t, p, frames)
+                bar.update()
+    finally:
+        if bar is not None:
+            bar.close()
+        if videos:
+            print("     finishing video files")
+        for video in videos.values():
+            video.close()
+
+    for p in positions:
+        if p["index"] in videos:
+            for path in videos[p["index"]].paths.values():
+                print(f"     saved {path}")
+
+
+def _video_renderer(f, read, positions, channels, times, out_dir: Path, stem: str, fps):
+    """Set up the mp4 writers; returns ``(render, videos)``.
+
+    ``render(t, p, frames)`` draws and writes one processed frame into that
+    position's three videos. ``videos`` maps position index -> ``VideoSet``.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    height, width = f.sizes["Y"], f.sizes["X"]
+    # libx264 + yuv420p needs even dimensions; drop a row/column if needed.
+    height, width = height - height % 2, width - width % 2
+    font_px = max(14, height // 40)
+    margin = font_px // 2
+
     print(f"     setting contrast from {CONTRAST_SAMPLES} timepoints per position")
-    limits = contrast_limits(read, positions, channels, n_t)
+    limits = contrast_limits(read, positions, channels, len(times))
 
     fluors = fluor_channels(channels)
     colors, used = {}, []
     for c in fluors:
         colors[c["key"]] = np.array(fluor_color(c["key"], used), np.float32)
         used.append(tuple(colors[c["key"]]))
-    legend = " + ".join(["phase"] + [c["key"] for c in fluors])
+    legend = text_label(" + ".join(["phase"] + [c["key"] for c in fluors]), font_px * 0.8)
 
     overlays, captions, videos = {}, {}, {}
     try:
         for p in positions:
             overlays[p["index"]] = trap_layer(width, height, p["traps"], font_px * 0.8)
             captions[p["index"]] = text_label(f"#{p['scope_number']} {p['name']}", font_px)
-            captions[(p["index"], "composite")] = text_label(legend, font_px * 0.8)
             videos[p["index"]] = VideoSet(out_dir, stem, p, (width, height), fps)
-
-        start = time.monotonic()
-        report_every = max(1, n_t // 10)
-        for t in range(n_t):
-            stamp = text_label(format_time(times[t]), font_px)
-            for p in positions:
-                frames = read(t, p["index"])
-                lim = limits[p["index"]]
-                phase = scale_to_unit(frames[PHASE_KEY][:height, :width], lim[PHASE_KEY])
-                gray = np.repeat(phase[:, :, np.newaxis], 3, axis=2)
-
-                def labelled(rgb, extra=None, p=p, stamp=stamp):
-                    blend(rgb, stamp, font_px // 2, font_px // 2)
-                    caption = captions[p["index"]]
-                    blend(rgb, caption, font_px // 2, height - caption.shape[0] - font_px // 2)
-                    if extra is not None:
-                        blend(rgb, extra, width - extra.shape[1] - font_px // 2, font_px // 2)
-                    return rgb
-
-                video = videos[p["index"]]
-                video.write("phase", labelled(gray.copy()))
-
-                composite = gray * COMPOSITE_PHASE_WEIGHT
-                for c in fluors:
-                    signal = scale_to_unit(frames[c["key"]][:height, :width], lim[c["key"]])
-                    composite += signal[:, :, np.newaxis] * colors[c["key"]]
-                np.clip(composite, 0.0, 1.0, out=composite)
-                video.write("composite", labelled(composite, captions[(p["index"], "composite")]))
-
-                video.write("traps", labelled(blend(gray, overlays[p["index"]])))
-
-            if (t + 1) % report_every == 0 or t + 1 == n_t:
-                elapsed = time.monotonic() - start
-                remaining = elapsed / (t + 1) * (n_t - t - 1)
-                print(f"     timepoint {t + 1}/{n_t}  "
-                      f"({elapsed / 60:.1f} min elapsed, ~{remaining / 60:.1f} min left)")
-    finally:
+    except BaseException:
         for video in videos.values():
             video.close()
+        raise
+    stamps = {}
 
-    for p in positions:
-        for path in videos[p["index"]].paths.values():
-            print(f"     saved {path}")
+    def render(t, p, frames):
+        if t not in stamps:
+            stamps.clear()
+            stamps[t] = text_label(format_time(times[t]), font_px)
+        lim = limits[p["index"]]
+        phase = scale_to_unit(frames[PHASE_KEY][:height, :width], lim[PHASE_KEY])
+        gray = np.repeat(phase[:, :, np.newaxis], 3, axis=2)
+
+        def labelled(rgb, extra=None):
+            blend(rgb, stamps[t], margin, margin)
+            caption = captions[p["index"]]
+            blend(rgb, caption, margin, height - caption.shape[0] - margin)
+            if extra is not None:
+                blend(rgb, extra, width - extra.shape[1] - margin, margin)
+            return rgb
+
+        video = videos[p["index"]]
+        video.write("phase", labelled(gray.copy()))
+
+        composite = gray * COMPOSITE_PHASE_WEIGHT
+        for c in fluors:
+            signal = scale_to_unit(frames[c["key"]][:height, :width], lim[c["key"]])
+            composite += signal[:, :, np.newaxis] * colors[c["key"]]
+        np.clip(composite, 0.0, 1.0, out=composite)
+        video.write("composite", labelled(composite, legend))
+
+        video.write("traps", labelled(blend(gray, overlays[p["index"]])))
+
+    return render, videos
+
+
+# --------------------------------------------------------------------------- #
+# 8. Cell density proxy and trap quantification
+# --------------------------------------------------------------------------- #
+
+def trap_key(position, trap) -> str:
+    """Dictionary key for a trap, e.g. 'pos1_ctrl-row_T1' (matches the video names)."""
+    return f"pos{position['scope_number']}_{safe_filename(position['name'])}_{trap['name']}"
+
+
+def quantification_fields(channels) -> list[str]:
+    """Names of the entries in each trap's tuple, in order."""
+    return ["density"] + [c["key"] for c in fluor_channels(channels)]
+
+
+def density_settings(f, seqs, positions, channels, shape, n_t, proxy, pixel_um,
+                     diameter_um=dp.CELL_DIAMETER_UM, bandpass=None) -> dict:
+    """Settings for density ``proxy``: window/GLCM scale, plus, if the proxy
+    needs them, a threshold and intensity range fixed for the whole run.
+
+    Those come from the trap pixels of ``DENSITY_SAMPLES`` phase frames per
+    position, spread over the run and pooled over every trap of every
+    position, so traps and timepoints stay comparable.
+    """
+    settings = dp.scale_settings(pixel_um, diameter_um)
+    if proxy not in dp.NEEDS_INTENSITY:
+        return settings
+    phase = [c for c in channels if c["role"] == "phase"]
+    sample_ts = sorted({int(t) for t in np.linspace(0, n_t - 1, DENSITY_SAMPLES).round()})
+    pooled = []
+    with ProgressBar(len(positions) * len(sample_ts), "sampling phase in traps") as bar:
+        for p in positions:
+            inside = trap_mask(shape, p["traps"])
+            for t in sample_ts:
+                frame = read_channels(f, seqs, t, p["index"], phase)[PHASE_KEY]
+                frame = bandpass(frame) if bandpass is not None else frame
+                pooled.append(np.asarray(frame[inside], np.float32))
+                bar.update()
+    settings.update(dp.intensity_settings(np.concatenate(pooled)))
+    settings["sampled_timepoints"] = sample_ts
+    return settings
+
+
+def report_density(proxy, settings) -> None:
+    print(f"     {proxy}: {dp.PROXY_LABELS[proxy]}")
+    print(f"     cell diameter {settings['diameter_um']:g} um = {settings['diameter_px']:.2f} px")
+    if proxy == "local_variance":
+        print(f"     window radius {settings['local_variance_radius_px']} px")
+    if proxy.startswith("glcm_"):
+        print(f"     {settings['glcm_levels']} gray levels, offsets (row, col) "
+              f"{settings['glcm_offsets']}")
+    if "value_range" in settings:
+        lo, hi = settings["value_range"]
+        n = len(settings["sampled_timepoints"])
+        print(f"     intensity range {lo:.4g} to {hi:.4g}, Otsu threshold "
+              f"{settings['threshold']:.4g} (from {n} timepoints per position)")
+
+
+class TrapQuantifier:
+    """Accumulates per-trap measurements, one timepoint at a time.
+
+    For each trap and timepoint it records:
+
+    - cell density proxy: ``proxy`` (a ``density_proxies.PROXY_LABELS`` key)
+      of the (bandpassed) phase inside the trap, with ``density_settings``.
+    - for each fluorescence channel: integrated background-subtracted
+      fluorescence inside the trap divided by the trap's area in pixels,
+      i.e. the mean per pixel.
+
+    A pixel is in the trap if its centre is inside the polygon or on its edge
+    (the same mask the background measurement excludes). Each trap is cut
+    out with a margin (``density_proxies.CROP_MARGIN_PX``) so gradients and
+    local windows at the trap's edge see real image beyond it.
+    """
+
+    def __init__(self, positions, channels, shape, n_t, proxy=dp.DEFAULT_PROXY,
+                 density_settings=None):
+        self.fields = quantification_fields(channels)
+        self.fluor_keys = self.fields[1:]
+        self.proxy = proxy
+        self.density_settings = density_settings or {}
+        self.values: dict[str, np.ndarray] = {}
+        self.areas_px: dict[str, int] = {}
+        self._regions: dict[int, list] = {}
+        for p in positions:
+            regions = []
+            for trap in p["traps"]:
+                mask = trap_mask(shape, [trap])
+                box = dp.trap_box(mask)
+                key = trap_key(p, trap)
+                regions.append((key, box, mask[box]))
+                self.values[key] = np.full((len(self.fields), n_t), np.nan)
+                self.areas_px[key] = int(mask.sum())
+            self._regions[p["index"]] = regions
+
+    def add(self, t, index, frames) -> None:
+        """Measure every trap of position ``index`` in its processed frames at ``t``."""
+        for key, box, inside in self._regions[index]:
+            row = self.values[key]
+            row[0, t] = dp.measure(self.proxy, frames[PHASE_KEY][box], inside,
+                                   self.density_settings)
+            for j, fluor in enumerate(self.fluor_keys, start=1):
+                region = frames[fluor][box][inside]
+                row[j, t] = float(np.sum(region, dtype=np.float64)) / self.areas_px[key]
+
+    def result(self, times) -> dict:
+        """``{trap_key: (density, fluor_1, ...), "Time": times}``, arrays over time."""
+        out = {key: tuple(values) for key, values in self.values.items()}
+        out["Time"] = np.asarray(times)
+        return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1155,9 +1431,14 @@ def parse_args(argv=None):
                         help="phase bandpass: largest structure kept, in um "
                              f"(default {DEFAULT_BANDPASS_MAX_UM})")
     parser.add_argument("--no-bandpass", action="store_true",
-                        help="write videos from unfiltered phase frames")
+                        help="quantify and write videos from unfiltered phase frames")
+    parser.add_argument("--density", choices=list(dp.PROXY_LABELS), default=dp.DEFAULT_PROXY,
+                        help=f"cell density proxy (default {dp.DEFAULT_PROXY})")
+    parser.add_argument("--cell-diameter-um", type=float, default=dp.CELL_DIAMETER_UM,
+                        help="typical cell diameter, sets the local variance window and "
+                             f"GLCM displacement (default {dp.CELL_DIAMETER_UM:g})")
     parser.add_argument("--skip-videos", action="store_true",
-                        help="stop after saving traps and metadata")
+                        help="quantify traps without writing videos")
     return parser.parse_args(argv)
 
 
@@ -1168,6 +1449,8 @@ def main(argv=None):
         sys.exit(f"File not found: {path}")
     if not args.no_bandpass and not 0 < args.bandpass_min_um < args.bandpass_max_um:
         sys.exit("Bandpass cutoffs must satisfy 0 < --bandpass-min-um < --bandpass-max-um.")
+    if args.cell_diameter_um <= 0:
+        sys.exit("--cell-diameter-um must be positive.")
     if args.traps and not args.traps.exists():
         sys.exit(f"Traps file not found: {args.traps}")
     objects_dir = args.objects or OBJECTS_DIR
@@ -1229,11 +1512,23 @@ def main(argv=None):
         fluor_backgrounds(positions, first_frames, channels, image_shape)
 
         bandpass = None
-        if not args.no_bandpass:
+        if args.no_bandpass:
+            print("\n[7] Spatial bandpass off (--no-bandpass)")
+        else:
+            print("\n[7] Spatial bandpass (FFT) for phase frames")
             bandpass = SpatialBandpass(image_shape, (v["x"], v["y"]),
                                        args.bandpass_min_um, args.bandpass_max_um)
+            report_bandpass(bandpass)
 
-        print("\n[7] Saving experiment layout")
+        print("\n[8] Cell density proxy")
+        density = density_settings(f, seqs, positions, channels, image_shape, len(times),
+                                   args.density, max(v["x"], v["y"]),
+                                   args.cell_diameter_um, bandpass)
+        report_density(args.density, density)
+        quantifier = TrapQuantifier(positions, channels, image_shape, len(times),
+                                    args.density, density)
+
+        print("\n[9] Saving experiment layout")
         layout = {
             "file": str(path.resolve()),
             **info,
@@ -1241,23 +1536,36 @@ def main(argv=None):
             "channels": channels,
             "positions": positions,
             "time_source": time_source,
-            "video_bandpass": bandpass.describe() if bandpass else None,
+            "phase_bandpass": bandpass.describe() if bandpass else None,
+            "quantification": {
+                "fields": quantifier.fields,
+                "density": {
+                    "proxy": args.density,
+                    "label": dp.PROXY_LABELS[args.density],
+                    "phase": "bandpassed" if bandpass else "unfiltered",
+                    "settings": density,
+                },
+                "fluorescence": "sum of background-subtracted fluorescence inside "
+                                "trap / trap area (counts per pixel)",
+                "trap_area_px": quantifier.areas_px,
+            },
             "Time": times,
         }
         save_pickle(layout, objects_dir / f"{stem}_metadata.pkl")
 
-        if bandpass is None:
-            print("\n[8] Spatial bandpass off (--no-bandpass)")
-        else:
-            print("\n[8] Spatial bandpass (FFT) for phase frames")
-            report_bandpass(bandpass)
-
+        n_traps = len(quantifier.values)
         if args.skip_videos:
-            print("\n[9] Skipping videos (--skip-videos)")
+            print(f"\n[10] Quantifying {n_traps} trap(s); videos skipped (--skip-videos)")
         else:
-            print(f"\n[9] Writing videos ({len(positions)} position(s) x 3, {args.fps:g} fps)")
-            write_videos(f, seqs, positions, channels, times, videos_dir, stem, args.fps,
-                         bandpass)
+            print(f"\n[10] Quantifying {n_traps} trap(s) and writing videos "
+                  f"({len(positions)} position(s) x 3, {args.fps:g} fps)")
+        process_frames(f, seqs, positions, channels, times, quantifier, bandpass,
+                       None if args.skip_videos else videos_dir, stem, args.fps)
+
+        print("\n[11] Saving trap measurements")
+        print(f"     each trap's tuple is ({', '.join(quantifier.fields)}), "
+              f"one value per timepoint")
+        save_pickle(quantifier.result(times), objects_dir / f"{stem}_quantified.pkl")
 
     print("\nDone.\n")
     return 0
